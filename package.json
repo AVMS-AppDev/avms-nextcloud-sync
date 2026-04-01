@@ -1,0 +1,21 @@
+{
+  "name": "@avms-appsuite/nextcloud-sync-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Nextcloud public-share sync module (standalone-first) for Showcase Kiosk content",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "start": "pnpm --filter @avms-appsuite/nextcloud-sync-runtime-api start",
+    "dev:dashboard": "pnpm --filter @avms-appsuite/nextcloud-sync-dashboard dev"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

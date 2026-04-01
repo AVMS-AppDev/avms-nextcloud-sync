@@ -1,0 +1,21 @@
+{
+  "name": "@avms-appsuite/nextcloud-sync-runtime-api",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/main.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@avms-appsuite/nextcloud-sync-contracts": "workspace:*",
+    "@avms-appsuite/nextcloud-sync-dav-client": "workspace:*",
+    "@avms-appsuite/nextcloud-sync-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
