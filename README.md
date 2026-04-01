@@ -18,6 +18,10 @@ pnpm start
 - API + embedded dashboard: `http://127.0.0.1:28570/dashboard/` (default port **28570**).
 - Override: `AVMS_NEXTCLOUD_SYNC_PORT`, `AVMS_NEXTCLOUD_SYNC_HOST`, `AVMS_NEXTCLOUD_SYNC_DATA_DIR`, `AVMS_NEXTCLOUD_SYNC_LOGS_DIR`, `AVMS_NEXTCLOUD_SYNC_DASHBOARD_DIR`.
 
+## Password-protected public shares
+
+Nextcloud expects **HTTP Basic** auth with **username = share token** (from `/s/{token}`) and **password = link password**. Send `sharePassword` on validate / store it on the profile; the runtime tries `token:password`, then `:password` as a fallback.
+
 ## Optional: Showcase content rescan
 
 After a successful sync, POST to the Showcase app’s content pipeline:

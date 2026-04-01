@@ -8,6 +8,8 @@ export interface RunContext {
   readonly profile: SyncProfile;
   readonly plan: PlanResult;
   readonly publicDavBaseUrl: string;
+  /** Share token for DAV Basic auth (username) when sharePassword is set. */
+  readonly shareToken: string;
   readonly localRootAbs: string;
   readonly signal: AbortSignal;
   readonly log: LogFn;
@@ -19,7 +21,9 @@ function tmpPath(target: string): string {
 }
 
 export async function executePlan(ctx: RunContext): Promise<{ ok: boolean; message?: string }> {
-  const { plan, localRootAbs, publicDavBaseUrl, signal, log, onProgress } = ctx;
+  const { plan, localRootAbs, publicDavBaseUrl, shareToken, signal, log, onProgress } = ctx;
+  const pwd = ctx.profile.sharePassword?.trim() ? ctx.profile.sharePassword : undefined;
+  const davOpts = { password: pwd, shareToken, signal };
 
   const ordered: PlanAction[] = [];
   for (const a of plan.actions) {
@@ -47,7 +51,7 @@ export async function executePlan(ctx: RunContext): Promise<{ ok: boolean; messa
       await mkdir(target, { recursive: true });
       await log("info", "DIR_OK", `Created dir`, { path: rel });
     } else if (a.kind === "download-file" || a.kind === "replace-file") {
-      const buf = await downloadFile(publicDavBaseUrl, rel, { signal });
+      const buf = await downloadFile(publicDavBaseUrl, rel, davOpts);
       bytesDone += buf.byteLength;
       await mkdir(dirname(target), { recursive: true });
       const t = tmpPath(target);

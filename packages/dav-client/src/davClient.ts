@@ -10,9 +10,38 @@ const PROPFIND_BODY = `<?xml version="1.0" encoding="utf-8" ?>
   </d:prop>
 </d:propfind>`;
 
+/** Identifies as a normal WebDAV client; some Nextcloud setups reject empty/minimal user agents. */
+const DAV_USER_AGENT = "avms-nextcloud-sync/0.1 (Nextcloud WebDAV)";
+
 export interface DavFetchOpts {
+  /** Public share link password (if any). */
   readonly password?: string;
+  /** Share token from `/s/{token}` — required for correct Basic auth on many Nextcloud servers (username=token, password=link password). */
+  readonly shareToken?: string;
   readonly signal?: AbortSignal;
+}
+
+/**
+ * Nextcloud public shares: usually Basic `base64(token + ":" + password)`.
+ * Fallback: `base64(":" + password)` (empty username).
+ */
+export function buildPublicShareAuthAttempts(opts: DavFetchOpts): (string | undefined)[] {
+  if (!opts.password) return [undefined];
+  const pass = opts.password;
+  const token = opts.shareToken?.trim() ?? "";
+  const seen = new Set<string>();
+  const out: (string | undefined)[] = [];
+  const add = (authorization: string | undefined) => {
+    const key = authorization ?? "";
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(authorization);
+  };
+  if (token) {
+    add(`Basic ${Buffer.from(`${token}:${pass}`, "utf8").toString("base64")}`);
+  }
+  add(`Basic ${Buffer.from(`:${pass}`, "utf8").toString("base64")}`);
+  return out;
 }
 
 export async function propfind(
@@ -20,25 +49,29 @@ export async function propfind(
   depth: "0" | "1" | "infinity",
   opts: DavFetchOpts = {},
 ): Promise<string> {
-  const headers: Record<string, string> = {
-    Depth: depth,
-    "Content-Type": "application/xml; charset=utf-8",
-  };
-  if (opts.password) {
-    const b64 = Buffer.from(`:${opts.password}`, "utf8").toString("base64");
-    headers.Authorization = `Basic ${b64}`;
+  const attempts = buildPublicShareAuthAttempts(opts);
+  let lastErr: Error | null = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const authorization = attempts[i];
+    const headers: Record<string, string> = {
+      Depth: depth,
+      "Content-Type": "application/xml; charset=utf-8",
+      "User-Agent": DAV_USER_AGENT,
+    };
+    if (authorization) headers.Authorization = authorization;
+    const res = await fetch(url, {
+      method: "PROPFIND",
+      headers,
+      body: PROPFIND_BODY,
+      signal: opts.signal,
+    });
+    const text = await res.text();
+    if (res.ok) return text;
+    lastErr = new Error(`PROPFIND ${res.status}: ${text.slice(0, 200)}`);
+    if (res.status === 401 && i < attempts.length - 1) continue;
+    throw lastErr;
   }
-  const res = await fetch(url, {
-    method: "PROPFIND",
-    headers,
-    body: PROPFIND_BODY,
-    signal: opts.signal,
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`PROPFIND ${res.status}: ${text.slice(0, 200)}`);
-  }
-  return text;
+  throw lastErr ?? new Error("PROPFIND failed");
 }
 
 export { parsePropfindMultistatus };
@@ -152,13 +185,17 @@ export async function downloadFile(
   const baseNorm = publicDavBaseUrl.endsWith("/") ? publicDavBaseUrl : `${publicDavBaseUrl}/`;
   const segments = relativePath.split("/").filter(Boolean).map((s) => encodeURIComponent(s));
   const url = `${baseNorm}${segments.join("/")}`;
-  const headers: Record<string, string> = {};
-  if (opts.password) {
-    headers.Authorization = `Basic ${Buffer.from(`:${opts.password}`, "utf8").toString("base64")}`;
+  const attempts = buildPublicShareAuthAttempts(opts);
+  let lastErr: Error | null = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const authorization = attempts[i];
+    const headers: Record<string, string> = { "User-Agent": DAV_USER_AGENT };
+    if (authorization) headers.Authorization = authorization;
+    const res = await fetch(url, { method: "GET", signal: opts.signal, headers });
+    if (res.ok) return res.arrayBuffer();
+    lastErr = new Error(`GET ${res.status} ${url}`);
+    if (res.status === 401 && i < attempts.length - 1) continue;
+    throw lastErr;
   }
-  const res = await fetch(url, { method: "GET", signal: opts.signal, headers });
-  if (!res.ok) {
-    throw new Error(`GET ${res.status} ${url}`);
-  }
-  return res.arrayBuffer();
+  throw lastErr ?? new Error(`GET failed ${url}`);
 }

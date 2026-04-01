@@ -194,7 +194,10 @@ export function startHttpServer(host: string, port: number, state: ServerState):
           return json(res, 422, { error: "local root does not exist or is not a directory" });
         }
         const pwd = profile.sharePassword?.trim() ? profile.sharePassword : undefined;
-        const remote = await listRemoteTree(norm.publicDavBaseUrl, { password: pwd });
+        const remote = await listRemoteTree(norm.publicDavBaseUrl, {
+          password: pwd,
+          shareToken: norm.shareToken,
+        });
         const local = await scanLocalTree(localAbs, profile.excludePatterns);
         const plan = buildPullMirrorPlan(profile, remote, local);
         await persistPlan(plan);
@@ -286,6 +289,7 @@ export function startHttpServer(host: string, port: number, state: ServerState):
               profile,
               plan,
               publicDavBaseUrl: norm.publicDavBaseUrl,
+              shareToken: norm.shareToken,
               localRootAbs: localAbs,
               signal: ac.signal,
               log,

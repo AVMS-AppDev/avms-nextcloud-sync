@@ -25,11 +25,13 @@ export async function validateShareRequest(req: ValidateRequest): Promise<Valida
   let itemCountEstimate = 0;
   let requiresPassword = false;
 
+  const davOpts = { password: pwd, shareToken: normalized.shareToken };
+
   try {
     const base = normalized.publicDavBaseUrl.endsWith("/")
       ? normalized.publicDavBaseUrl
       : `${normalized.publicDavBaseUrl}/`;
-    const xml0 = await propfind(base, "0", { password: pwd });
+    const xml0 = await propfind(base, "0", davOpts);
     const nodes = parsePropfindMultistatus(xml0);
     const root = nodes[0];
     if (root) {
@@ -40,7 +42,7 @@ export async function validateShareRequest(req: ValidateRequest): Promise<Valida
         /collection/.test(xml0);
     }
     try {
-      const xml1 = await propfind(base, "1", { password: pwd });
+      const xml1 = await propfind(base, "1", davOpts);
       const { entries } = entriesFromPropfind(base, xml1);
       itemCountEstimate = entries.length;
     } catch {
@@ -49,8 +51,19 @@ export async function validateShareRequest(req: ValidateRequest): Promise<Valida
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes("401") || msg.toLowerCase().includes("unauthorized")) {
-      requiresPassword = true;
-      errors.push({ code: "auth_required", message: "Share requires a password or credentials failed" });
+      if (pwd) {
+        errors.push({
+          code: "auth_failed",
+          message:
+            "Share rejected the provided password (or token). Try the link password in sharePassword; Nextcloud expects Basic auth username=share token, password=link password.",
+        });
+      } else {
+        requiresPassword = true;
+        errors.push({
+          code: "auth_required",
+          message: "Share requires a password — send sharePassword in the validate request (and ensure shareUrl contains the token).",
+        });
+      }
     } else {
       errors.push({ code: "remote_unreachable", message: msg });
     }

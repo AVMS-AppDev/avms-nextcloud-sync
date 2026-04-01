@@ -5,6 +5,7 @@ export {
   downloadFile,
   entriesFromPropfind,
   parsePropfindMultistatus,
+  buildPublicShareAuthAttempts,
   type DavFetchOpts,
   type RemoteFileEntry,
 } from "./davClient.js";
