@@ -1,0 +1,74 @@
+{
+  "$schema": "https://avms.dev/schemas/module.json",
+  "moduleId": "avms-nextcloud-sync",
+  "productId": "nextcloud-sync",
+  "name": "AVMS Nextcloud Sync",
+  "displayName": "Nextcloud Sync",
+  "kind": "module",
+  "version": "0.1.0",
+  "description": "Nextcloud public-share sync module — pulls content from Nextcloud WebDAV into local Showcase directories",
+  "type": "service",
+  "runMode": "standalone",
+  "startPolicy": "on_demand",
+  "transport": "http",
+
+  "entryPoints": {
+    "main": { "type": "node", "path": "packages/runtime-api/src/main.ts" }
+  },
+
+  "api": {
+    "defaultPort": 28570,
+    "healthEndpoint": "/api/nextcloud-sync/status",
+    "loopbackOnly": true,
+    "protocol": "http",
+    "endpoints": [
+      "GET /api/nextcloud-sync/status",
+      "GET /api/nextcloud-sync/profiles",
+      "POST /api/nextcloud-sync/profiles",
+      "PUT /api/nextcloud-sync/profiles/:id",
+      "DELETE /api/nextcloud-sync/profiles/:id",
+      "POST /api/nextcloud-sync/validate",
+      "POST /api/nextcloud-sync/plan",
+      "POST /api/nextcloud-sync/run",
+      "POST /api/nextcloud-sync/cancel/:id",
+      "GET /api/nextcloud-sync/jobs",
+      "GET /api/nextcloud-sync/jobs/:id",
+      "GET /api/nextcloud-sync/logs/:id"
+    ]
+  },
+
+  "capabilities": {
+    "nextcloudSync": true,
+    "contentBridge": true,
+    "embeddedDashboard": true,
+    "manualSync": true,
+    "autoSync": false,
+    "backgroundMode": true,
+    "watchdogAttach": false,
+    "autostart": false
+  },
+
+  "provides": ["nextcloud-sync", "content-bridge"],
+
+  "dependencies": {
+    "required": [],
+    "optional": [
+      { "moduleId": "avms-showcase-kiosk", "role": "content-consumer" }
+    ],
+    "standaloneComplete": true
+  },
+
+  "health": {
+    "endpoint": "/api/nextcloud-sync/status",
+    "protocol": "http",
+    "heartbeatIntervalMs": 30000,
+    "heartbeatTimeoutMs": 60000
+  },
+
+  "ui": {
+    "icon": "cloud-download",
+    "color": "#0ea5e9",
+    "category": "services",
+    "showInDashboard": true
+  }
+}
