@@ -55,6 +55,7 @@ export async function executePlan(ctx: RunContext): Promise<{ ok: boolean; messa
       await mkdir(target, { recursive: true });
       await log("info", "DIR_OK", `Created dir`, { path: rel });
     } else if (a.kind === "download-file" || a.kind === "replace-file") {
+      const davRel = a.remoteDavPath ?? rel;
       if (a.kind === "replace-file" && ctx.conflictPaths?.has(rel) && ctx.resolveConflict) {
         const resolution = await ctx.resolveConflict(rel, {
           size: a.remote?.size ?? 0,
@@ -72,7 +73,7 @@ export async function executePlan(ctx: RunContext): Promise<{ ok: boolean; messa
           return { ok: false, message: "cancelled" };
         }
       }
-      const buf = await downloadFile(publicDavBaseUrl, rel, davOpts);
+      const buf = await downloadFile(publicDavBaseUrl, davRel, davOpts);
       bytesDone += buf.byteLength;
       await mkdir(dirname(target), { recursive: true });
       const t = tmpPath(target);

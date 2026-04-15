@@ -142,7 +142,10 @@ export type PlanActionKind =
 
 export interface PlanAction {
   readonly kind: PlanActionKind;
+  /** Local relative path under profile.localRoot (after optional brand→folder mapping). */
   readonly path: string;
+  /** DAV path under the share when it differs from `path` (brand mapping); omit if same as `path`. */
+  readonly remoteDavPath?: string;
   readonly remote?: {
     readonly etag?: string;
     readonly size: number;

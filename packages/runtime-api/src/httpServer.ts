@@ -20,6 +20,7 @@ import { checkLocalPath, resolveLocalRoot } from "./localPath.js";
 import { loadSyncState, saveSyncState, toRemoteStateMap } from "./syncStateStore.js";
 import { validateShareRequest } from "./validateShare.js";
 import { loadLastValidation, persistLastValidation } from "./validationStore.js";
+import { buildLocalPathForDavFromSegmentMap, parseBrandLocalSegmentMap } from "./brandMapping.js";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const SERVICE_VERSION = "0.1.0";
@@ -343,8 +344,50 @@ export function startHttpServer(host: string, port: number, state: ServerState):
         return json(res, 200, r);
       }
 
+      if (req.method === "POST" && path === "/api/nextcloud-sync/brands") {
+        const body = (await readJson(req)) as { shareUrl?: string; sharePassword?: string };
+        if (!body.shareUrl?.trim()) return json(res, 422, { error: "shareUrl required" });
+        const norm = normalizeShare(String(body.shareUrl));
+        if (!norm) return json(res, 422, { error: "invalid share url" });
+        const pwd = body.sharePassword?.trim() ? String(body.sharePassword) : undefined;
+        let remote;
+        try {
+          remote = await listRemoteTree(norm.publicDavBaseUrl, {
+            password: pwd,
+            shareToken: norm.shareToken,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const auth = classifyAuthFailureMessage(msg);
+          if (auth) {
+            return json(res, 401, {
+              error: auth.code,
+              message: auth.message,
+              diagnostics: { resolvedDavBaseUrl: norm.publicDavBaseUrl, hasSharePassword: Boolean(pwd) },
+            });
+          }
+          return json(res, 502, { error: "remote_listing_failed", message: msg });
+        }
+        const roots = new Set<string>();
+        for (const r of remote) {
+          const seg = r.relativePath.split("/").filter(Boolean)[0];
+          if (seg) roots.add(seg);
+        }
+        const brands = [...roots].sort((a, b) => a.localeCompare(b));
+        return json(res, 200, {
+          shareToken: norm.shareToken,
+          resolvedDavBaseUrl: norm.publicDavBaseUrl,
+          brands,
+          remoteFileCount: remote.length,
+        });
+      }
+
       if (req.method === "POST" && path === "/api/nextcloud-sync/plan") {
-        const body = (await readJson(req)) as { profileId?: string };
+        const body = (await readJson(req)) as {
+          profileId?: string;
+          brandAllowList?: string[];
+          brandLocalSegmentMap?: unknown;
+        };
         if (!body.profileId) return json(res, 422, { error: "profileId required" });
         const profile = await getProfile(body.profileId);
         if (!profile) return json(res, 404, { error: "profile not found" });
@@ -386,15 +429,35 @@ export function startHttpServer(host: string, port: number, state: ServerState):
             },
           });
         }
+        const allow = Array.isArray(body.brandAllowList)
+          ? body.brandAllowList.map((s) => String(s).trim()).filter(Boolean)
+          : [];
+        const filteredRemote =
+          allow.length > 0
+            ? remote.filter((r) =>
+                allow.some((b) => r.relativePath === b || r.relativePath.startsWith(`${b}/`)),
+              )
+            : remote;
+        const parsedMap = parseBrandLocalSegmentMap(body.brandLocalSegmentMap);
+        if (!parsedMap.ok) return json(res, 422, { error: parsedMap.error });
+        const segmentMap = parsedMap.map;
+        const localPathForDav =
+          segmentMap.size > 0 ? buildLocalPathForDavFromSegmentMap(segmentMap) : undefined;
         const local = await scanLocalTree(localAbs, profile.excludePatterns);
         const previousState = await loadSyncState(profile.id);
-        const plan = buildPullMirrorPlan(profile, remote, local, toRemoteStateMap(previousState));
+        const plan = buildPullMirrorPlan(profile, filteredRemote, local, toRemoteStateMap(previousState), {
+          localPathForDav,
+        });
         await persistPlan(plan);
         return json(res, 200, {
           ...plan,
           diagnostics: {
             deltaComparison: "size-first, then remote etag/lastModified when previous remote state exists",
             previousStateSeenAt: previousState?.updatedAt ?? null,
+            brandAllowList: allow.length ? allow : null,
+            brandLocalSegmentMap: segmentMap.size > 0 ? Object.fromEntries(segmentMap) : null,
+            remoteFileCountBeforeFilter: remote.length,
+            remoteFileCountPlanned: filteredRemote.length,
           },
         });
       }
