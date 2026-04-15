@@ -14,6 +14,10 @@ export interface RunContext {
   readonly signal: AbortSignal;
   readonly log: LogFn;
   readonly onProgress: (completed: number, total: number, bytes: number, totalBytes: number, current: string | null) => void;
+  readonly conflictPaths?: ReadonlySet<string>;
+  readonly resolveConflict?: (path: string, remote: { size: number; etag?: string; lastModified?: string }) => Promise<{
+    decision: "replace" | "keep_local" | "cancel_run";
+  }>;
 }
 
 function tmpPath(target: string): string {
@@ -51,6 +55,23 @@ export async function executePlan(ctx: RunContext): Promise<{ ok: boolean; messa
       await mkdir(target, { recursive: true });
       await log("info", "DIR_OK", `Created dir`, { path: rel });
     } else if (a.kind === "download-file" || a.kind === "replace-file") {
+      if (a.kind === "replace-file" && ctx.conflictPaths?.has(rel) && ctx.resolveConflict) {
+        const resolution = await ctx.resolveConflict(rel, {
+          size: a.remote?.size ?? 0,
+          etag: a.remote?.etag,
+          lastModified: a.remote?.lastModified,
+        });
+        if (resolution.decision === "keep_local") {
+          await log("warn", "CONFLICT_KEEP_LOCAL", "Kept local version for conflicted file", { path: rel });
+          step++;
+          onProgress(step, totalSteps, bytesDone, totalBytes, rel);
+          continue;
+        }
+        if (resolution.decision === "cancel_run") {
+          await log("warn", "RUN_CANCELLED", "Run cancelled from conflict decision", { path: rel });
+          return { ok: false, message: "cancelled" };
+        }
+      }
       const buf = await downloadFile(publicDavBaseUrl, rel, davOpts);
       bytesDone += buf.byteLength;
       await mkdir(dirname(target), { recursive: true });

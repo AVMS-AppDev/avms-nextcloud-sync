@@ -2,15 +2,24 @@ import { createReadStream, existsSync, readFileSync } from "fs";
 import http, { type IncomingMessage, type ServerResponse } from "http";
 import { dirname, extname, join, resolve } from "path";
 import { fileURLToPath } from "url";
-import type { JobRecord, RunRequest, SyncProfile, ValidateRequest } from "@avms-appsuite/nextcloud-sync-contracts";
+import type {
+  ConflictDecision,
+  ConflictItem,
+  JobRecord,
+  RunRequest,
+  SyncProfile,
+  ValidateRequest,
+} from "@avms-appsuite/nextcloud-sync-contracts";
 import { listRemoteTree, normalizeShare } from "@avms-appsuite/nextcloud-sync-dav-client";
-import { buildPullMirrorPlan, executePlan, scanLocalTree } from "@avms-appsuite/nextcloud-sync-core";
+import { buildPullMirrorPlan, executePlan, scanLocalTree, type LocalFileInfo } from "@avms-appsuite/nextcloud-sync-core";
 import { dataRootDir } from "./paths.js";
 import { deleteProfile, getProfile, listProfiles, saveProfile } from "./profileStore.js";
 import { loadPlan, persistPlan } from "./planStore.js";
 import { appendJobLog, listJobs, loadJob, persistLogLine, readJobLogs, saveJob } from "./jobStore.js";
 import { checkLocalPath, resolveLocalRoot } from "./localPath.js";
+import { loadSyncState, saveSyncState, toRemoteStateMap } from "./syncStateStore.js";
 import { validateShareRequest } from "./validateShare.js";
+import { loadLastValidation, persistLastValidation } from "./validationStore.js";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const SERVICE_VERSION = "0.1.0";
@@ -90,7 +99,109 @@ export interface ServerState {
   readonly abortControllers: Map<string, AbortController>;
 }
 
+function toLastRunSummary(jobs: readonly JobRecord[]): Record<string, unknown> | null {
+  const completed = jobs.find((j) => j.finishedAt !== null);
+  if (!completed) return null;
+  return {
+    jobId: completed.jobId,
+    profileId: completed.profileId,
+    state: completed.state,
+    startedAt: completed.startedAt,
+    finishedAt: completed.finishedAt,
+    result: completed.result,
+    summary: completed.planSummary,
+    progress: completed.progress,
+    errors: completed.errors,
+    warnings: completed.warnings,
+  };
+}
+
+function classifyRun(job: JobRecord): "success" | "failed" | "aborted" | "running" {
+  if (job.state === "running" || job.state === "queued" || job.state === "awaiting_decision") return "running";
+  if (job.state === "completed") return "success";
+  const msg = job.result?.message?.toLowerCase() ?? "";
+  if (msg.includes("aborted") || msg.includes("cancel")) return "aborted";
+  return "failed";
+}
+
+function summarizeCounters(job: JobRecord | null): Record<string, number> | null {
+  if (!job?.planSummary) return null;
+  return {
+    discoveredFiles: job.planSummary.downloadFiles + job.planSummary.replaceFiles + job.planSummary.skipped,
+    downloadedOrReplaced: job.planSummary.downloadFiles + job.planSummary.replaceFiles,
+    skipped: job.planSummary.skipped,
+    failed: job.errors.length,
+    deletedLocal: job.planSummary.deleteLocalFiles,
+  };
+}
+
+function classifyAuthFailureMessage(message: string): { code: string; message: string } | null {
+  const lower = message.toLowerCase();
+  if (lower.includes("propfind 401") || lower.includes("get 401") || lower.includes("unauthorized")) {
+    return {
+      code: "auth_failed",
+      message:
+        "Share authentication failed. For password-protected public shares, provide sharePassword and ensure shareUrl contains the /s/{token}.",
+    };
+  }
+  return null;
+}
+
+interface ConflictDetectionContext {
+  readonly currentLocal: ReadonlyMap<string, LocalFileInfo>;
+  readonly previousLocal: ReadonlyMap<string, { size: number; mtimeMs: number }>;
+}
+
+interface JobConflictSession {
+  readonly jobId: string;
+  readonly conflicts: ConflictItem[];
+  nextIndex: number;
+  pending: ConflictItem | null;
+  applyToRemainingDecision: ConflictDecision | null;
+  waiter: ((value: { decision: ConflictDecision; applyToRemaining: boolean }) => void) | null;
+}
+
+function toPreviousLocalMap(state: Awaited<ReturnType<typeof loadSyncState>>): ReadonlyMap<string, { size: number; mtimeMs: number }> {
+  const map = new Map<string, { size: number; mtimeMs: number }>();
+  if (!state) return map;
+  for (const f of state.local) {
+    map.set(f.path, { size: f.size, mtimeMs: f.mtimeMs });
+  }
+  return map;
+}
+
+function detectConflicts(
+  plan: Awaited<ReturnType<typeof buildPullMirrorPlan>>,
+  ctx: ConflictDetectionContext,
+): ConflictItem[] {
+  const conflicts: ConflictItem[] = [];
+  for (const action of plan.actions) {
+    if (action.kind !== "replace-file") continue;
+    const local = ctx.currentLocal.get(action.path);
+    const baseline = ctx.previousLocal.get(action.path);
+    if (!local || !baseline) continue;
+    const locallyDrifted = local.size !== baseline.size || Math.abs(local.mtimeMs - baseline.mtimeMs) > 1000;
+    if (!locallyDrifted) continue;
+    conflicts.push({
+      id: action.path,
+      path: action.path,
+      reason: "local_drift_from_baseline",
+      baseline,
+      local: { size: local.size, mtimeMs: local.mtimeMs },
+      remote: action.remote
+        ? {
+            size: action.remote.size,
+            etag: action.remote.etag,
+            lastModified: action.remote.lastModified,
+          }
+        : undefined,
+    });
+  }
+  return conflicts;
+}
+
 export function startHttpServer(host: string, port: number, state: ServerState): http.Server {
+  const conflictSessions = new Map<string, JobConflictSession>();
   const server = http.createServer(async (req, res) => {
     cors(res);
     if (req.method === "OPTIONS") {
@@ -108,6 +219,27 @@ export function startHttpServer(host: string, port: number, state: ServerState):
 
       if (req.method === "GET" && path === "/api/nextcloud-sync/status") {
         const profiles = await listProfiles();
+        const jobs = await listJobs();
+        const lastValidation = await loadLastValidation();
+        const targets = profiles.map((p) => {
+          const normalized = normalizeShare(p.shareUrl);
+          return {
+            profileId: p.id,
+            name: p.name,
+            shareUrl: p.shareUrl,
+            shareToken: normalized?.shareToken ?? null,
+            resolvedDavBaseUrl: normalized?.publicDavBaseUrl ?? null,
+            localRoot: p.localRoot,
+          };
+        });
+        const activeJob =
+          state.activeJobId === null ? null : jobs.find((j) => j.jobId === state.activeJobId) ?? null;
+        const lastSuccess = jobs.find((j) => j.state === "completed" && j.finishedAt !== null) ?? null;
+        const lastNonSuccess =
+          jobs.find((j) => j.finishedAt !== null && classifyRun(j) !== "success") ?? null;
+        const lastRun = toLastRunSummary(jobs);
+        const lastSuccessfulRunSummary = lastSuccess ? toLastRunSummary([lastSuccess]) : null;
+        const lastNonSuccessRunSummary = lastNonSuccess ? toLastRunSummary([lastNonSuccess]) : null;
         return json(res, 200, {
           service: "avms-nextcloud-sync",
           version: SERVICE_VERSION,
@@ -122,6 +254,35 @@ export function startHttpServer(host: string, port: number, state: ServerState):
             autoSync: false,
             twoWayExperimental: false,
           },
+          targets,
+          activeJob,
+          lastRun,
+          lastSuccessfulRun: lastSuccess && lastSuccessfulRunSummary
+            ? {
+                ...lastSuccessfulRunSummary,
+                runClass: classifyRun(lastSuccess),
+                counters: summarizeCounters(lastSuccess),
+              }
+            : null,
+          lastNonSuccessRun: lastNonSuccess && lastNonSuccessRunSummary
+            ? {
+                ...lastNonSuccessRunSummary,
+                runClass: classifyRun(lastNonSuccess),
+                counters: summarizeCounters(lastNonSuccess),
+              }
+            : null,
+          runClass: lastRun && jobs.length > 0 ? classifyRun(jobs[0]) : null,
+          counters: summarizeCounters(jobs[0] ?? null),
+          lastValidation,
+        });
+      }
+
+      if (req.method === "GET" && path === "/api/nextcloud-sync/health") {
+        return json(res, 200, {
+          service: "avms-nextcloud-sync",
+          healthy: true,
+          activeJobId: state.activeJobId,
+          lastCompletedJobAt: state.lastCompletedJobAt,
         });
       }
 
@@ -178,6 +339,7 @@ export function startHttpServer(host: string, port: number, state: ServerState):
       if (req.method === "POST" && path === "/api/nextcloud-sync/validate") {
         const body = (await readJson(req)) as ValidateRequest;
         const r = await validateShareRequest(body);
+        await persistLastValidation(body, r);
         return json(res, 200, r);
       }
 
@@ -194,14 +356,47 @@ export function startHttpServer(host: string, port: number, state: ServerState):
           return json(res, 422, { error: "local root does not exist or is not a directory" });
         }
         const pwd = profile.sharePassword?.trim() ? profile.sharePassword : undefined;
-        const remote = await listRemoteTree(norm.publicDavBaseUrl, {
-          password: pwd,
-          shareToken: norm.shareToken,
-        });
+        let remote;
+        try {
+          remote = await listRemoteTree(norm.publicDavBaseUrl, {
+            password: pwd,
+            shareToken: norm.shareToken,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const auth = classifyAuthFailureMessage(msg);
+          if (auth) {
+            return json(res, 401, {
+              error: auth.code,
+              message: auth.message,
+              diagnostics: {
+                shareUrl: profile.shareUrl,
+                resolvedDavBaseUrl: norm.publicDavBaseUrl,
+                hasSharePassword: Boolean(pwd),
+              },
+            });
+          }
+          return json(res, 502, {
+            error: "remote_listing_failed",
+            message: msg,
+            diagnostics: {
+              shareUrl: profile.shareUrl,
+              resolvedDavBaseUrl: norm.publicDavBaseUrl,
+              hasSharePassword: Boolean(pwd),
+            },
+          });
+        }
         const local = await scanLocalTree(localAbs, profile.excludePatterns);
-        const plan = buildPullMirrorPlan(profile, remote, local);
+        const previousState = await loadSyncState(profile.id);
+        const plan = buildPullMirrorPlan(profile, remote, local, toRemoteStateMap(previousState));
         await persistPlan(plan);
-        return json(res, 200, plan);
+        return json(res, 200, {
+          ...plan,
+          diagnostics: {
+            deltaComparison: "size-first, then remote etag/lastModified when previous remote state exists",
+            previousStateSeenAt: previousState?.updatedAt ?? null,
+          },
+        });
       }
 
       if (req.method === "POST" && path === "/api/nextcloud-sync/run") {
@@ -262,6 +457,23 @@ export function startHttpServer(host: string, port: number, state: ServerState):
         }
         const localAbs = resolveLocalRoot(profile.localRoot);
         const pwd = profile.sharePassword?.trim() ? profile.sharePassword : undefined;
+        const localNow = await scanLocalTree(localAbs, profile.excludePatterns);
+        const previousState = await loadSyncState(profile.id);
+        const conflicts = detectConflicts(plan, {
+          currentLocal: new Map(localNow.map((f) => [f.relativePath, f])),
+          previousLocal: toPreviousLocalMap(previousState),
+        });
+        const conflictSession: JobConflictSession = {
+          jobId,
+          conflicts,
+          nextIndex: 0,
+          pending: null,
+          applyToRemainingDecision: null,
+          waiter: null,
+        };
+        if (conflicts.length > 0) {
+          conflictSessions.set(jobId, conflictSession);
+        }
 
         void (async () => {
           const log = async (
@@ -293,6 +505,49 @@ export function startHttpServer(host: string, port: number, state: ServerState):
               localRootAbs: localAbs,
               signal: ac.signal,
               log,
+              conflictPaths: new Set(conflicts.map((c) => c.path)),
+              resolveConflict: async (path, remote) => {
+                const session = conflictSessions.get(jobId);
+                if (!session) return { decision: "replace" as const };
+                if (session.applyToRemainingDecision) {
+                  return { decision: session.applyToRemainingDecision };
+                }
+                const next = session.conflicts[session.nextIndex];
+                if (!next || next.path !== path) return { decision: "replace" as const };
+                session.pending = {
+                  ...next,
+                  remote: {
+                    size: remote.size,
+                    etag: remote.etag,
+                    lastModified: remote.lastModified,
+                  },
+                };
+                job.state = "awaiting_decision";
+                await saveJob(job);
+                await log("warn", "CONFLICT_AWAITING_DECISION", "Run paused for conflict decision", {
+                  path: next.path,
+                });
+                const decisionPayload = await new Promise<{ decision: ConflictDecision; applyToRemaining: boolean }>(
+                  (resolveDecision) => {
+                    session.waiter = resolveDecision;
+                  },
+                );
+                if (decisionPayload.applyToRemaining) {
+                  session.applyToRemainingDecision = decisionPayload.decision;
+                }
+                session.nextIndex += 1;
+                session.pending = null;
+                if (decisionPayload.decision !== "cancel_run") {
+                  job.state = "running";
+                  await saveJob(job);
+                }
+                await log("info", "CONFLICT_DECISION_APPLIED", "Conflict decision applied", {
+                  path: next.path,
+                  decision: decisionPayload.decision,
+                  applyToRemaining: decisionPayload.applyToRemaining,
+                });
+                return { decision: decisionPayload.decision };
+              },
               onProgress: (completed, total, bytes, totalBytes, currentPath) => {
                 job.progress = {
                   completedActions: completed,
@@ -304,6 +559,28 @@ export function startHttpServer(host: string, port: number, state: ServerState):
                 void saveJob(job);
               },
             });
+
+            if (result.message === "cancelled") {
+              job.state = "cancelled";
+              job.finishedAt = new Date().toISOString();
+              job.result = { ok: false, message: "cancelled" };
+              await log("warn", "RUN_CANCELLED", "Sync job cancelled by operator request", {});
+            } else {
+              job.state = result.ok ? "completed" : "failed";
+              job.finishedAt = new Date().toISOString();
+              job.result = { ok: result.ok, message: result.message };
+            }
+
+            if (result.ok) {
+              // Persist sync-state only after a successful run, so delta comparisons
+              // are based on confirmed completed mirrors, not preview-only plan snapshots.
+              const remoteAfter = await listRemoteTree(norm.publicDavBaseUrl, {
+                password: pwd,
+                shareToken: norm.shareToken,
+              });
+              const localAfter = await scanLocalTree(localAbs, profile.excludePatterns);
+              await saveSyncState(profile.id, remoteAfter, localAfter);
+            }
 
             if (result.ok && profile.postSync?.triggerShowcaseReindex) {
               const url = process.env.AVMS_SHOWCASE_RESCAN_URL?.trim();
@@ -318,22 +595,39 @@ export function startHttpServer(host: string, port: number, state: ServerState):
                 }
               }
             }
-
-            job.state = result.ok ? "completed" : "failed";
-            job.finishedAt = new Date().toISOString();
-            job.result = { ok: result.ok, message: result.message };
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
-            await log("error", "RUN_FAILED", msg, {});
+            const aborted = ac.signal.aborted || msg.toLowerCase().includes("aborted") || msg.toLowerCase().includes("cancel");
+            if (aborted) {
+              await log("warn", "RUN_CANCELLED", "Sync job cancelled by operator request", {});
+              job.state = "cancelled";
+              job.finishedAt = new Date().toISOString();
+              job.result = { ok: false, message: "cancelled" };
+              job.errors.push({ code: "run_cancelled", message: "cancelled" });
+              state.activeJobId = null;
+              state.abortControllers.delete(jobId);
+              state.lastCompletedJobAt = job.finishedAt;
+              await saveJob(job);
+              return;
+            }
+            const auth = classifyAuthFailureMessage(msg);
+            if (auth) {
+              await log("error", "RUN_AUTH_FAILED", auth.message, {});
+              job.errors.push({ code: auth.code, message: auth.message });
+              job.result = { ok: false, message: auth.message };
+            } else {
+              await log("error", "RUN_FAILED", msg, {});
+              job.errors.push({ code: "run_failed", message: msg });
+              job.result = { ok: false, message: msg };
+            }
             job.state = "failed";
             job.finishedAt = new Date().toISOString();
-            job.result = { ok: false, message: msg };
-            job.errors.push({ code: "run_failed", message: msg });
           }
 
           state.activeJobId = null;
           state.abortControllers.delete(jobId);
           state.lastCompletedJobAt = job.finishedAt;
+          conflictSessions.delete(jobId);
           await saveJob(job);
         })();
 
@@ -346,7 +640,61 @@ export function startHttpServer(host: string, port: number, state: ServerState):
           const jobId = decodeURIComponent(m[1] ?? "");
           const ac = state.abortControllers.get(jobId);
           if (ac) ac.abort();
+          const session = conflictSessions.get(jobId);
+          if (session?.waiter) {
+            const waiter = session.waiter;
+            session.waiter = null;
+            session.pending = null;
+            waiter({ decision: "cancel_run", applyToRemaining: false });
+          }
           return json(res, 200, { ok: true });
+        }
+      }
+
+      {
+        const m = /^\/api\/nextcloud-sync\/conflicts\/([^/]+)\/?$/.exec(path);
+        if (m && req.method === "GET") {
+          const jobId = decodeURIComponent(m[1] ?? "");
+          const j = await loadJob(jobId);
+          if (!j) return json(res, 404, { error: "job_not_found" });
+          const session = conflictSessions.get(jobId);
+          return json(res, 200, {
+            jobId,
+            state: j.state,
+            pendingCount: session ? session.conflicts.length - session.nextIndex : 0,
+            current: session?.pending ?? null,
+            applyToRemainingDecision: session?.applyToRemainingDecision ?? null,
+          });
+        }
+      }
+
+      {
+        const m = /^\/api\/nextcloud-sync\/conflicts\/([^/]+)\/decision\/?$/.exec(path);
+        if (m && req.method === "POST") {
+          const jobId = decodeURIComponent(m[1] ?? "");
+          const session = conflictSessions.get(jobId);
+          if (!session) return json(res, 404, { error: "conflict_session_not_found" });
+          if (!session.pending || !session.waiter) {
+            return json(res, 409, { error: "no_pending_conflict" });
+          }
+          const body = (await readJson(req)) as { decision?: ConflictDecision; applyToRemaining?: boolean };
+          const decision = body.decision;
+          if (decision !== "replace" && decision !== "keep_local" && decision !== "cancel_run") {
+            return json(res, 422, { error: "decision must be replace|keep_local|cancel_run" });
+          }
+          const applyToRemaining = Boolean(body.applyToRemaining);
+          const waiter = session.waiter;
+          session.waiter = null;
+          const pending = session.pending;
+          session.pending = null;
+          waiter({ decision, applyToRemaining });
+          return json(res, 200, {
+            ok: true,
+            jobId,
+            resolvedConflictId: pending.id,
+            decision,
+            applyToRemaining,
+          });
         }
       }
 

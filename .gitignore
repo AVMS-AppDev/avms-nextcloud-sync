@@ -7,3 +7,6 @@ Logs/
 Thumbs.db
 .env
 .env.local
+
+# Agent / local verification scratch (never ship)
+.tmp/

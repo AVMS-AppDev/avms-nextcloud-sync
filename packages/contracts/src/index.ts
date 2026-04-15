@@ -44,6 +44,54 @@ export interface StatusResponse {
     readonly autoSync: boolean;
     readonly twoWayExperimental: boolean;
   };
+  readonly targets?: readonly {
+    readonly profileId: string;
+    readonly name: string;
+    readonly shareUrl: string;
+    readonly shareToken: string | null;
+    readonly resolvedDavBaseUrl: string | null;
+    readonly localRoot: string;
+  }[];
+  readonly activeJob?: JobRecord | null;
+  readonly lastRun?: {
+    readonly jobId: string;
+    readonly profileId: string;
+    readonly state: JobState;
+    readonly startedAt: string;
+    readonly finishedAt: string | null;
+    readonly result: { readonly ok: boolean; readonly message?: string } | null;
+    readonly summary: PlanSummary | null;
+    readonly progress: JobProgress;
+    readonly errors: readonly { readonly code: string; readonly message: string }[];
+    readonly warnings: readonly string[];
+  } | null;
+  readonly lastSuccessfulRun?: Record<string, unknown> | null;
+  readonly lastNonSuccessRun?: Record<string, unknown> | null;
+  readonly runClass?: "success" | "failed" | "aborted" | "running" | null;
+  readonly counters?: {
+    readonly discoveredFiles: number;
+    readonly downloadedOrReplaced: number;
+    readonly skipped: number;
+    readonly failed: number;
+    readonly deletedLocal: number;
+  } | null;
+  readonly lastValidation?: {
+    readonly checkedAt: string;
+    readonly request: {
+      readonly shareUrl: string;
+      readonly localRoot: string;
+      readonly hasSharePassword: boolean;
+    };
+    readonly result: {
+      readonly ok: boolean;
+      readonly normalizedShareToken?: string;
+      readonly resolvedDavBaseUrl?: string;
+      readonly reachable?: boolean;
+      readonly requiresPassword?: boolean;
+      readonly errorCodes: readonly string[];
+      readonly firstError?: string;
+    };
+  } | null;
 }
 
 export interface ValidateRequest {
@@ -133,7 +181,7 @@ export interface RunAccepted {
   readonly state: "queued" | "running";
 }
 
-export type JobState = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type JobState = "queued" | "running" | "awaiting_decision" | "completed" | "failed" | "cancelled";
 
 export interface JobProgress {
   completedActions: number;
@@ -154,6 +202,25 @@ export interface JobRecord {
   result: { ok: boolean; message?: string } | null;
   warnings: string[];
   errors: { code: string; message: string }[];
+}
+
+export type ConflictDecision = "replace" | "keep_local" | "cancel_run";
+
+export interface ConflictItem {
+  readonly id: string;
+  readonly path: string;
+  readonly reason: "local_drift_from_baseline";
+  readonly baseline?: { readonly size: number; readonly mtimeMs: number };
+  readonly local?: { readonly size: number; readonly mtimeMs: number };
+  readonly remote?: { readonly size?: number; readonly etag?: string; readonly lastModified?: string };
+}
+
+export interface ConflictStatusResponse {
+  readonly jobId: string;
+  readonly state: JobState;
+  readonly pendingCount: number;
+  readonly current: ConflictItem | null;
+  readonly applyToRemainingDecision: ConflictDecision | null;
 }
 
 export interface LogEntry {

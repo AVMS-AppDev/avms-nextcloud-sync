@@ -57,6 +57,7 @@ export function buildPullMirrorPlan(
   profile: SyncProfile,
   remote: readonly RemoteFileEntry[],
   local: readonly LocalFileInfo[],
+  previousRemoteState?: ReadonlyMap<string, { etag?: string; size: number; lastModified?: string }>,
 ): PlanResult {
   const mode: SyncMode = profile.mode;
   const deletePolicy: DeletePolicy = profile.deletePolicy;
@@ -90,6 +91,7 @@ export function buildPullMirrorPlan(
 
   for (const [path, r] of remoteMap) {
     const loc = localMap.get(path);
+    const prev = previousRemoteState?.get(path);
     if (!loc) {
       actions.push({
         kind: "download-file",
@@ -97,6 +99,24 @@ export function buildPullMirrorPlan(
         remote: { etag: r.etag ?? undefined, size: r.size, lastModified: r.lastModified ?? undefined },
       });
     } else if (loc.size !== r.size) {
+      actions.push({
+        kind: "replace-file",
+        path,
+        remote: { etag: r.etag ?? undefined, size: r.size, lastModified: r.lastModified ?? undefined },
+      });
+    } else if (prev && prev.size !== loc.size) {
+      actions.push({
+        kind: "replace-file",
+        path,
+        remote: { etag: r.etag ?? undefined, size: r.size, lastModified: r.lastModified ?? undefined },
+      });
+    } else if (prev && r.etag && prev.etag && prev.etag !== r.etag) {
+      actions.push({
+        kind: "replace-file",
+        path,
+        remote: { etag: r.etag ?? undefined, size: r.size, lastModified: r.lastModified ?? undefined },
+      });
+    } else if (prev && r.lastModified && prev.lastModified && prev.lastModified !== r.lastModified) {
       actions.push({
         kind: "replace-file",
         path,
