@@ -41,6 +41,14 @@ await build({
   format: "cjs",
   sourcemap: true,
   logLevel: "warning",
+  // CJS output doesn't support `import.meta.url` — inject a shim so the
+  // bundled server can still use it for resolving relative module paths.
+  banner: {
+    js: "const __import_meta_url = require('url').pathToFileURL(__filename).href;",
+  },
+  define: {
+    "import.meta.url": "__import_meta_url",
+  },
 });
 log("  app/server.cjs bundled");
 
