@@ -1,0 +1,59 @@
+{
+  "schemaVersion": "1.0",
+  "repoId": "avms-nextcloud-sync",
+  "displayName": "AVMS Nextcloud Sync",
+  "kind": "service",
+  "status": "active",
+  "summary": "Standalone Sync-Service: spiegelt Nextcloud Public-Shares auf lokale Content-Ordner. Manueller Pull-Mirror mit Conflict-Detection, Brand-Mapping, Safety-Gates. Node.js, HTTP API auf Port 28570.",
+  "owns": [
+    "Nextcloud WebDAV Client (PROPFIND, share normalization, Basic auth)",
+    "Sync Planner (pull-mirror plan generation, conflict detection)",
+    "Sync Runner (atomic file operations, conflict resolution, ordered execution)",
+    "Profile Management (CRUD, persistence, safety policies)",
+    "Job Management (status tracking, progress, cancellation)",
+    "Sync State / Baseline Tracking (drift detection between syncs)",
+    "Brand-to-Local Folder Mapping",
+    "Embedded Vue Dashboard (/dashboard/)",
+    "HTTP API (11+ endpoints on port 28570)"
+  ],
+  "doesNotOwn": [
+    "Content rendering / viewer (avms-app-mocon)",
+    "Content-Tree scanning (avms-app-mocon Backend)",
+    "Kiosk UI / operator dashboard (avms-app-mocon)",
+    "Nextcloud server infrastructure",
+    "Watchdog / health monitoring (avms-watchdog-service)",
+    "Background auto-sync (not implemented — manual only)"
+  ],
+  "standalone": true,
+  "dashboard": "embedded Vue app at /dashboard/",
+  "api": "HTTP loopback (port 28570)",
+  "ipc": false,
+  "runtime": "Node.js 20+",
+  "packaging": "Self-contained bundle with bundled Node.js (tools/node/node.exe)",
+  "consumes": [
+    "Nextcloud WebDAV — public share PROPFIND + GET (external, read-only)",
+    "avms-app-mocon — optional POST to content rescan endpoint after sync"
+  ],
+  "consumedBy": [
+    "avms-app-mocon — Cloud Sync Operator Panel (HTTP API consumer)"
+  ],
+  "relatedRepos": [
+    "avms-app-mocon"
+  ],
+  "replaces": [],
+  "replacedBy": [],
+  "compatibleWith": [],
+  "capabilities": [
+    { "id": "cloudsync.nextcloud", "name": "Nextcloud Cloud Sync", "status": "supported", "summary": "Manual pull-mirror from Nextcloud public shares to local folders" },
+    { "id": "cloudsync.conflict-detection", "name": "Conflict Detection", "status": "supported", "summary": "Baseline-tracked drift detection with user-driven resolution (replace/keep/cancel)" },
+    { "id": "cloudsync.brand-mapping", "name": "Brand Folder Mapping", "status": "supported", "summary": "Map remote top-level folders to local brand directories" },
+    { "id": "cloudsync.embedded-dashboard", "name": "Embedded Dashboard", "status": "supported", "summary": "Vue-based web dashboard served at /dashboard/" }
+  ],
+  "canonicalDocs": [],
+  "repoUrl": "https://github.com/AVMS-AppDev/avms-nextcloud-sync",
+  "protectedBehaviors": [
+    { "id": "pb-no-data-loss", "name": "No silent data loss", "summary": "Deletes require explicit deletePolicy + confirmDeletes flag, atomic file operations via temp files", "whyProtected": "Content loss on kiosk machines is unrecoverable without backup", "verificationHint": "Run sync with mirror-delete policy → API requires confirmDeletes, temp files used for downloads" },
+    { "id": "pb-conflict-resolution", "name": "User-driven conflict resolution", "summary": "When local file changed since last sync, user must decide per-conflict (replace/keep/cancel)", "whyProtected": "Automated overwrites could destroy operator edits", "verificationHint": "Modify local file → re-plan → plan shows conflict → run requires user decision" },
+    { "id": "pb-baseline-tracking", "name": "Sync baseline tracking", "summary": "After successful sync, baseline state saved for next conflict detection", "whyProtected": "Without baseline, every file looks like a conflict", "verificationHint": "After sync, check sync-state.json contains file sizes and mtimes" }
+  ]
+}
