@@ -96,9 +96,16 @@ function serveDashboardStatic(req: IncomingMessage, res: ServerResponse, urlPath
 
 export interface ServerState {
   activeJobId: string | null;
+  /** ISO timestamp of when the active job started — used by the watchdog to auto-release stale locks. */
+  activeJobStartedAt: string | null;
   lastCompletedJobAt: string | null;
   readonly abortControllers: Map<string, AbortController>;
 }
+
+/** Auto-unlock a run-job that has been holding the lock longer than this (ms). */
+const STALE_JOB_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+/** How often the watchdog checks for stale locks (ms). */
+const STALE_JOB_CHECK_INTERVAL_MS = 60 * 1000; // 60 seconds
 
 function toLastRunSummary(jobs: readonly JobRecord[]): Record<string, unknown> | null {
   const completed = jobs.find((j) => j.finishedAt !== null);
@@ -484,13 +491,18 @@ export function startHttpServer(host: string, port: number, state: ServerState):
           });
         }
         if (state.activeJobId) {
-          return json(res, 409, { error: "job_already_running", activeJobId: state.activeJobId });
+          return json(res, 409, {
+            error: "job_already_running",
+            activeJobId: state.activeJobId,
+            activeJobStartedAt: state.activeJobStartedAt,
+          });
         }
 
         const jobId = `job_${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.random().toString(36).slice(2, 8)}`;
         const ac = new AbortController();
         state.abortControllers.set(jobId, ac);
         state.activeJobId = jobId;
+        state.activeJobStartedAt = new Date().toISOString();
 
         const job: JobRecord = {
           jobId,
@@ -515,6 +527,7 @@ export function startHttpServer(host: string, port: number, state: ServerState):
         const norm = normalizeShare(profile.shareUrl);
         if (!norm) {
           state.activeJobId = null;
+          state.activeJobStartedAt = null;
           state.abortControllers.delete(jobId);
           return json(res, 500, { error: "invalid share" });
         }
@@ -668,6 +681,7 @@ export function startHttpServer(host: string, port: number, state: ServerState):
               job.result = { ok: false, message: "cancelled" };
               job.errors.push({ code: "run_cancelled", message: "cancelled" });
               state.activeJobId = null;
+              state.activeJobStartedAt = null;
               state.abortControllers.delete(jobId);
               state.lastCompletedJobAt = job.finishedAt;
               await saveJob(job);
@@ -688,6 +702,7 @@ export function startHttpServer(host: string, port: number, state: ServerState):
           }
 
           state.activeJobId = null;
+          state.activeJobStartedAt = null;
           state.abortControllers.delete(jobId);
           state.lastCompletedJobAt = job.finishedAt;
           conflictSessions.delete(jobId);
@@ -761,6 +776,29 @@ export function startHttpServer(host: string, port: number, state: ServerState):
         }
       }
 
+      if (req.method === "POST" && path === "/api/nextcloud-sync/unlock-job") {
+        // Force-release the active-job lock. Operator path for the case where a
+        // previous job crashed or hung without clearing state (e.g. launcher
+        // killed mid-run, conflict waiter never resolved). Does NOT touch any
+        // file / job on disk — only the in-memory lock + abort controller.
+        const previous = state.activeJobId;
+        const previousStartedAt = state.activeJobStartedAt;
+        if (previous) {
+          const ac = state.abortControllers.get(previous);
+          if (ac) {
+            try { ac.abort(); } catch { /* ignore */ }
+          }
+          state.abortControllers.delete(previous);
+        }
+        state.activeJobId = null;
+        state.activeJobStartedAt = null;
+        return json(res, 200, {
+          ok: true,
+          forceUnlocked: previous,
+          previousStartedAt,
+        });
+      }
+
       if (req.method === "GET" && path === "/api/nextcloud-sync/jobs") {
         const jobs = await listJobs();
         return json(res, 200, jobs);
@@ -794,5 +832,32 @@ export function startHttpServer(host: string, port: number, state: ServerState):
   server.listen(port, host, () => {
     console.info(`[nextcloud-sync] http://${host}:${port}  dashboard: /dashboard/`);
   });
+
+  // Watchdog: periodically auto-release stale active-job locks so a crashed /
+  // hung job does not permanently block future runs. The lock stays put if a
+  // legitimate job is still within the time threshold.
+  const staleLockWatchdog = setInterval(() => {
+    if (!state.activeJobId || !state.activeJobStartedAt) return;
+    const startedAtMs = Date.parse(state.activeJobStartedAt);
+    if (Number.isNaN(startedAtMs)) return;
+    const ageMs = Date.now() - startedAtMs;
+    if (ageMs < STALE_JOB_THRESHOLD_MS) return;
+    const stuckJobId = state.activeJobId;
+    console.warn(
+      `[nextcloud-sync] watchdog: auto-releasing stale active-job lock jobId=${stuckJobId} age=${Math.round(ageMs / 1000)}s (threshold=${Math.round(STALE_JOB_THRESHOLD_MS / 1000)}s)`,
+    );
+    const ac = state.abortControllers.get(stuckJobId);
+    if (ac) {
+      try { ac.abort(); } catch { /* ignore */ }
+    }
+    state.abortControllers.delete(stuckJobId);
+    state.activeJobId = null;
+    state.activeJobStartedAt = null;
+  }, STALE_JOB_CHECK_INTERVAL_MS);
+  // Don't keep the process alive just for the watchdog.
+  if (typeof staleLockWatchdog.unref === "function") {
+    staleLockWatchdog.unref();
+  }
+
   return server;
 }
